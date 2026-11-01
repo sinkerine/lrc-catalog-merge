@@ -15,6 +15,8 @@
       forAllSystems = nixpkgs.lib.genAttrs systems;
     in
     {
+      homeManagerModules.default = import ./nix/home-manager.nix self;
+
       packages = forAllSystems (
         system:
         let
@@ -27,6 +29,7 @@
             pyproject = true;
             src = ./.;
             build-system = [ pkgs.python3Packages.setuptools ];
+            dependencies = [ pkgs.python3Packages.pyyaml ];
             nativeCheckInputs = [
               pkgs.python3Packages.pytestCheckHook
               pkgs.rocksdb.tools
@@ -45,7 +48,10 @@
         {
           default = pkgs.mkShell {
             packages = [
-              (pkgs.python3.withPackages (ps: [ ps.pytest ]))
+              (pkgs.python3.withPackages (ps: [
+                ps.pytest
+                ps.pyyaml
+              ]))
               pkgs.rocksdb.tools
               pkgs.sqlite
             ];

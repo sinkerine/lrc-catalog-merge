@@ -9,7 +9,7 @@ import tempfile
 from datetime import datetime
 from pathlib import Path
 
-from . import backups, catalog, lrcat_data
+from . import backups, catalog, config, lrcat_data
 
 
 def parse_args(argv: list[str] | None) -> argparse.Namespace:
@@ -22,12 +22,18 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "sources", nargs="+", type=Path, metavar="SOURCE",
-        help="Lightroom backup directory holding 'YYYY-MM-DD HHMM/<catalog>.zip' folders",
+        "sources", nargs="*", type=Path, metavar="SOURCE",
+        help="Lightroom backup directory holding 'YYYY-MM-DD HHMM/<catalog>.zip' folders "
+        "(default: the config's sources)",
+    )
+    parser.add_argument(
+        "-c", "--config", type=Path,
+        help=f"YAML config (default: {config.default_path()} if it exists)",
     )
     parser.add_argument(
         "-o", "--output", action="append", type=Path, metavar="DIR",
-        help="backup directory to write the merged catalog to (repeatable; default: every SOURCE)",
+        help="backup directory to write the merged catalog to (repeatable; default: the "
+        "config's outputs, else every SOURCE). The config's exclude_folders still apply.",
     )
     parser.add_argument(
         "--no-lrcat-data", action="store_true",
@@ -44,13 +50,37 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def resolve(args: argparse.Namespace) -> tuple[list[Path], list[config.Output]]:
+    settings = config.Config()
+    path = args.config or config.default_path()
+    if args.config or path.is_file():
+        settings = config.load(path)
+
+    sources = [s.resolve() for s in (args.sources or settings.sources)]
+    if not sources:
+        raise config.ConfigError("no sources: pass SOURCE directories or set sources in the config")
+    if len(set(sources)) != len(sources):
+        raise config.ConfigError("a source directory is listed twice")
+
+    excludes = {o.path.resolve(): o.exclude_folders for o in settings.outputs}
+    if args.output:
+        paths = [o.resolve() for o in args.output]
+    elif settings.outputs:
+        paths = [o.path.resolve() for o in settings.outputs]
+    else:
+        paths = sources
+    if len(set(paths)) != len(paths):
+        raise config.ConfigError("an output directory is listed twice")
+    return sources, [config.Output(p, excludes.get(p, ())) for p in paths]
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    sources = [s.resolve() for s in args.sources]
-    if len(set(sources)) != len(sources):
-        print("error: a source directory is listed twice", file=sys.stderr)
+    try:
+        sources, outputs = resolve(args)
+    except (config.ConfigError, OSError) as e:
+        print(f"error: {e}", file=sys.stderr)
         return 2
-    outputs = [o.resolve() for o in (args.output or sources)]
 
     latest = [backups.latest(s) for s in sources]
     base = latest[0]
@@ -87,14 +117,43 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"warning: merge added {new} dangling references in {ref}")
         print(f"merged catalog: {catalog.image_count(str(target))} photos")
 
+        # One catalog per distinct exclusion list; outputs without one share the merge.
+        catalogs: dict[tuple[str, ...], Path] = {(): target}
+        for output in outputs:
+            if output.exclude_folders in catalogs:
+                continue
+            excluded = work / f"excluded-{len(catalogs)}" / target.name
+            excluded.parent.mkdir()
+            shutil.copy2(target, excluded)
+            stats = catalog.exclude_folders(str(excluded), list(output.exclude_folders))
+            print(f"for {output.path}:")
+            print(stats.summary())
+            unmatched = [f for f in output.exclude_folders if f not in stats.folders]
+            for folder in unmatched:
+                print(f"  warning: exclude_folders entry matched no folder: {folder}")
+            problems = catalog.integrity_check(str(excluded))
+            if problems != "ok":
+                print(f"error: catalog for {output.path} failed integrity check: {problems}",
+                      file=sys.stderr)
+                return 1
+            for ref, count in sorted(catalog.check_references(str(excluded)).items()):
+                new = count - base_dangling.get(ref, 0)
+                if new > 0:
+                    print(f"  warning: exclusion left {new} dangling references in {ref}")
+            print(f"  catalog: {catalog.image_count(str(excluded))} photos")
+            catalogs[output.exclude_folders] = excluded
+
         if args.dry_run:
             print("dry run: nothing written")
             return 0
 
-        stamp = backups.next_stamp(outputs, datetime.now())
+        stamp = backups.next_stamp([o.path for o in outputs], datetime.now())
         sep = backups.separator(base.archive)
         for output in outputs:
-            archive = backups.write(target, target_data, base.catalog_name, sep, output, stamp)
+            archive = backups.write(
+                catalogs[output.exclude_folders], target_data, base.catalog_name, sep,
+                output.path, stamp,
+            )
             print(f"wrote {archive}")
     return 0
 

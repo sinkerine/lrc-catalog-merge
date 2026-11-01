@@ -586,6 +586,140 @@ def _note_newer(db: sqlite3.Connection, stats: MergeStats, source_touch, target_
         stats.newer_duplicates += 1
 
 
+# Columns through which deleting a row deletes the rows that point at it:
+# a row goes when what it belongs to goes. Besides OWNER, this covers the
+# folder -> file -> photo chain, virtual copies, link rows, and the image
+# refs of tables the merge does not copy.
+CASCADE: dict[str, tuple[str, ...]] = {
+    **{table: (column,) for table, column in OWNER.items()},
+    "AgLibraryFolder": ("rootFolder",),
+    "AgLibraryFile": ("folder",),
+    "Adobe_images": ("rootFile", "masterImage"),
+    "AgLibraryKeywordImage": ("image",),
+    "AgLibraryCollectionImage": ("image",),
+    "AgLibraryCollectionImageChangeCounter": ("collectionImage", "image"),
+    "AgLibraryCollectionCoverImage": ("collectionImage",),
+    "AgLibraryCollectionStackImage": ("image",),
+    "AgLibraryPublishedCollectionImage": ("image",),
+    "AgRemotePhoto": ("photo",),
+    "AgPhotoComment": ("photo",),
+    "AgLibraryImageSyncedAssetData": ("image",),
+    "AgLibraryImageOzAssetIds": ("image",),
+    "AgOzAssetSettings": ("image",),
+    "AgLibraryOzFeedbackInfo": ("image",),
+    "AgLibraryCollectionImageOzAlbumAssetIds": ("collectionImage", "image"),
+    "AgLibraryCollectionImageOzSortOrder": ("collectionImage",),
+    "AgTempImages": ("image",),
+    "AgLastCatalogExport": ("image",),
+    "AgLibraryUpdatedImages": ("image",),
+    "MigratedImages": ("localId",),
+    "MigratedCollectionImages": ("localCollectionImageId",),
+}
+# Optional refs cleared instead of cascading, so e.g. removing a face does
+# not remove every other face in its cluster.
+NULLIFY: tuple[tuple[str, str], ...] = (
+    ("AgLibraryFaceCluster", "keyFace"),
+    ("Adobe_images", "originalRootEntity"),
+    ("AgLibraryFace", "cluster"),
+)
+
+
+def _folder_prefix(path: str) -> str:
+    path = path.replace("\\", "/")
+    return (path if path.endswith("/") else path + "/").casefold()
+
+
+@dataclass
+class ExcludeStats:
+    folders: list[str] = field(default_factory=list)
+    photos: int = 0
+    rows: int = 0
+
+    def summary(self) -> str:
+        if not self.folders:
+            return "  excluded: nothing matched"
+        return f"  excluded {self.photos} photos in: {', '.join(self.folders)}"
+
+
+def exclude_folders(path: str, folders: list[str]) -> ExcludeStats:
+    """Remove the given folders (and subfolders) and everything in them."""
+    stats = ExcludeStats()
+    prefixes = [_folder_prefix(f) for f in folders]
+    if not prefixes:
+        return stats
+    db = sqlite3.connect(path, isolation_level=None)
+    db.text_factory = _text_factory
+    try:
+        db.execute("begin immediate")
+        db.execute("create temp table gone (id integer primary key)")
+
+        def matched(full_path: str) -> str | None:
+            normalized = _folder_prefix(full_path)
+            return next((f for f, p in zip(folders, prefixes) if normalized.startswith(p)), None)
+
+        hits: set[str] = set()
+        folder_rows = db.execute(
+            "select id_local, absolutePath from AgLibraryRootFolder union all "
+            "select f.id_local, r.absolutePath || f.pathFromRoot from AgLibraryFolder f "
+            "join AgLibraryRootFolder r on r.id_local = f.rootFolder"
+        ).fetchall()
+        for folder_id, full_path in folder_rows:
+            if (folder := matched(full_path)) is not None:
+                db.execute("insert or ignore into gone values (?)", (folder_id,))
+                hits.add(folder)
+        stats.folders = [f for f in folders if f in hits]
+
+        tables = _tables(db, "main")
+        cascade = [
+            (table, column)
+            for table, columns in CASCADE.items() if table in tables
+            for column in columns if column in _columns(db, "main", table)
+        ]
+        # Collect the ids to delete first; deleting as we go would hide rows
+        # whose owner was already removed.
+        while True:
+            before = db.execute("select count(*) from gone").fetchone()[0]
+            for table, column in cascade:
+                if "id_local" in _columns(db, "main", table):
+                    db.execute(
+                        f'insert or ignore into gone select id_local from "{table}" '
+                        f'where "{column}" in (select id from gone) and id_local is not null'
+                    )
+            if db.execute("select count(*) from gone").fetchone()[0] == before:
+                break
+
+        stats.photos = db.execute(
+            "select count(*) from Adobe_images where id_local in (select id from gone)"
+        ).fetchone()[0]
+        for table, column in NULLIFY:
+            if table in tables:
+                db.execute(
+                    f'update "{table}" set "{column}" = null where "{column}" in (select id from gone)'
+                )
+        for table, column in cascade:
+            stats.rows += db.execute(
+                f'delete from "{table}" where "{column}" in (select id from gone)'
+            ).rowcount
+        for table in ("AgLibraryFile", "AgLibraryFolder", "AgLibraryRootFolder"):
+            stats.rows += db.execute(
+                f'delete from "{table}" where id_local in (select id from gone)'
+            ).rowcount
+        # Stacks left without photos (triggers drop their stack data).
+        for stack in ("AgLibraryFolderStack", "AgLibraryCollectionStack"):
+            if stack in tables and f"{stack}Image" in tables:
+                db.execute(
+                    f'delete from "{stack}" where id_local not in '
+                    f'(select stack from "{stack}Image")'
+                )
+        db.execute("commit")
+    except BaseException:
+        db.execute("rollback")
+        raise
+    finally:
+        db.close()
+    return stats
+
+
 def check_references(path: str) -> dict[str, int]:
     """Count references in ``path`` that point at no existing row."""
     db = sqlite3.connect(f"file:{path}?mode=ro", uri=True)

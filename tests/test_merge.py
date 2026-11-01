@@ -165,3 +165,64 @@ def test_write_keeps_backslash_layout(tmp_path):
     extracted, extracted_data = backups.extract(backups.latest(tmp_path / "out"), tmp_path / "x")
     assert extracted.read_bytes() == b"db"
     assert (extracted_data / "CURRENT").read_text() == "MANIFEST-1\n"
+
+
+def test_exclude_folders_removes_photos_and_their_rows(tmp_path):
+    target, source = tmp_path / "t.lrcat", tmp_path / "s.lrcat"
+    make_catalog(target, 10, [("a", 1)])
+    make_catalog(source, 10, [("c", 3)])
+    db = sqlite3.connect(source)
+    db.execute("update AgLibraryRootFolder set absolutePath = 'C:/Users/asako/Pictures/'")
+    db.commit()
+    db.close()
+    catalog.merge_catalog(str(target), str(source))
+    assert set(photos(target)) == {"a", "c"}
+
+    stats = catalog.exclude_folders(str(target), ["c:\\users\\Asako\\Pictures"])
+
+    assert stats.folders == ["c:\\users\\Asako\\Pictures"]
+    assert stats.photos == 1
+    assert photos(target) == {"a": 1}
+    assert catalog.integrity_check(str(target)) == "ok"
+    assert catalog.check_references(str(target)) == {}
+    db = sqlite3.connect(target)
+    for table in ("AgLibraryRootFolder", "AgLibraryFolder", "AgLibraryFile",
+                  "Adobe_imageDevelopSettings", "AgLibraryKeywordImage", "AgLibraryFace",
+                  "AgLibraryFaceData"):
+        assert db.execute(f"select count(*) from {table}").fetchone() == (1,), table
+    # Keywords are catalog-wide and stay.
+    assert db.execute("select count(*) from AgLibraryKeyword").fetchone() == (2,)
+
+
+def test_exclude_folders_matches_subfolders_only_on_path_boundaries(tmp_path):
+    target = tmp_path / "t.lrcat"
+    make_catalog(target, 10, [("a", 1)])
+    assert catalog.exclude_folders(str(target), ["Y:/tr"]).photos == 0
+    assert catalog.exclude_folders(str(target), ["Y:/trip/"]).photos == 1
+
+
+def test_config_and_cli_resolution(tmp_path, monkeypatch):
+    from lrc_catalog_merge import cli, config
+
+    a, b = tmp_path / "a", tmp_path / "b"
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        f"sources: [{a}, {b}]\n"
+        f"outputs:\n  - path: {a}\n    exclude_folders: ['C:/Users/asako/']\n  - {b}\n"
+    )
+    sources, outputs = cli.resolve(cli.parse_args(["-c", str(path)]))
+    assert sources == [a, b]
+    assert outputs == [config.Output(a, ("C:/Users/asako/",)), config.Output(b)]
+
+    # -o narrows the outputs but keeps the config's exclusions.
+    sources, outputs = cli.resolve(cli.parse_args(["-c", str(path), "-o", str(a)]))
+    assert outputs == [config.Output(a, ("C:/Users/asako/",))]
+
+    # Without a config, sources are the outputs.
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "none"))
+    sources, outputs = cli.resolve(cli.parse_args([str(a), str(b)]))
+    assert outputs == [config.Output(a), config.Output(b)]
+
+    path.write_text("sources: [x]\nbogus: 1\n")
+    with pytest.raises(config.ConfigError):
+        config.load(path)
